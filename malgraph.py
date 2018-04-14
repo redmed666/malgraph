@@ -14,6 +14,7 @@ FUNCTIONS_PATH = './functions/'
 USER = 'neo4j'
 PASSWORD = 'THIS_IS_ONLY_A_TEST'
 THRESHOLD = 0.70
+THRESHOLD_FCT_SIZE = 300
 NEO4JURI = 'bolt://localhost:7687'
 app = Flask(__name__, static_url_path=STATIC_PATH)
 
@@ -74,22 +75,23 @@ class Neo4jDriver(object):
     def create_query_function_similar(self, function_sha256,
                                       function_sha256_target,
                                       similarity):
-
+        """
         query = "CREATE (function_" + function_sha256 + ")"
         query += "-[:SIMILAR {similarity: " + str(similarity) + "}]->"
         query += "(function_" + function_sha256_target + ")\n"
         """
-        query = "MATCH (funcion_" + function_sha256 + ":Function {sha256:'" + function_sha256 + \
+        query = "MATCH (function_" + function_sha256 + ":Function {sha256:'" + function_sha256 + \
             "'}), (function_" + function_sha256_target + \
             ":Function {sha256:'" + function_sha256_target + "'})\n"
         query += "CREATE (function_" + function_sha256 + ")-[:SIMILAR_TO {similarity:" + \
             str(similarity) + "}]->(function_" + function_sha256_target + ")\n"
-        """
+
         return query
 
     def create_query_sample_has_function(self, sample_sha256,
                                          function_sha256):
-        query = "(" + sample_sha256 + ")-[:HAS]->(" + function_sha256 + ")"
+        query = ""
+        query += "(" + sample_sha256 + ")-[:HAS]->(" + function_sha256 + ")"
         return query
 
 
@@ -169,7 +171,7 @@ def perform_analysis(binary_path):
             'ph sha256 ' + str(function_info['size']) + ' @ ' + offset)
 
         if not os.path.isfile(FUNCTIONS_PATH + function_sha256):
-            if function_info['size'] >= 400:
+            if function_info['size'] >= THRESHOLD_FCT_SIZE:
                 function = Function(
                     function_md5,
                     function_sha256,
@@ -180,7 +182,6 @@ def perform_analysis(binary_path):
 
                 functions.append(function)
 
-                blocks = r2p.cmdj('afbj @ ' + offset)
                 open(FUNCTIONS_PATH + function_sha256, 'a').close()
                 r2p.cmd('s ' + offset + ';wta ' + FUNCTIONS_PATH +
                         function.sha256 + ' $Fs @@c:afbq')
@@ -199,6 +200,20 @@ def get_max_similarity(similarities_map):
         return None
 
 
+def checksums(file_stream):
+    BUF_SIZE = 65536  # lets read stuff in 64kb chunks!
+
+    md5 = hashlib.md5()
+    sha256 = hashlib.sha256()
+    while True:
+        data = file_stream.read(BUF_SIZE)
+        if not data:
+            break
+        md5.update(data)
+        sha256.update(data)
+    return (md5, sha256)
+
+
 @app.route('/samples', methods=['POST'])
 def post_sample():
     if 'file' not in request.files:
@@ -210,46 +225,47 @@ def post_sample():
 
     tmp_file = tempfile.NamedTemporaryFile()
     file.save(tmp_file.name)
+    md5, sha256 = checksums(tmp_file)
     sample = perform_analysis(tmp_file.name)
     if sample is not None:
-        md5 = hashlib.md5()
-        sha256 = hashlib.sha256()
-        md5.update(file.stream.read())
-        sha256.update(file.stream.read())
         sample.md5 = md5.hexdigest()
         sample.sha256 = sha256.hexdigest()
         tmp_file.close()
         db = Neo4jDriver()
         query_new_node = db.create_query_new_node(sample)
-        query_relationship = ""
+        query_relationship = []
+
         for function in sample.functions:
             fct_found_in_db = False
             query_function_same_size = db.create_query_get_fct_same_size(
                 function)
             functions_same_size = db.send_query(query_function_same_size)
             similarities = {}
+
             for fct_same_size in functions_same_size:
                 fct_compared = fct_same_size[0]
                 if fct_compared == function.sha256:
                     query_sample_has_function = db.create_query_sample_has_function(
                         sample.sha256, function.sha256)
-                    query_relationship += query_sample_has_function
+                    query_relationship.append(query_sample_has_function)
                     fct_found_in_db = True
                     break
                 else:
                     similarities[fct_compared] = calculate_functions_similarity(
                         function.sha256, fct_compared)
+
             if fct_found_in_db == False:
                 fct_max_simil = get_max_similarity(similarities)
                 if fct_max_simil is not None:
                     if similarities[fct_max_simil] >= THRESHOLD:
-                        query_relationship += db.create_query_function_similar(
-                            function.sha256, fct_max_simil, similarities[fct_max_simil])
+                        query_relationship.append(db.create_query_function_similar(
+                            function.sha256, fct_max_simil, similarities[fct_max_simil]))
 
         db.send_query(query_new_node)
 
-        if query_relationship != "":
-            db.send_query(query_relationship)
+        print("FOUND SIMILAR! ", query_relationship)
+        for query in query_relationship:
+            db.send_query(query)
         db.close()
         return sample.md5 + " /// " + sample.sha256
 
