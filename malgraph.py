@@ -6,6 +6,8 @@ import json
 import hashlib
 import os
 import string
+import re
+import subprocess
 
 STATIC_PATH = '/static/'
 FUNCTIONS_PATH = './functions/'
@@ -54,8 +56,6 @@ class Neo4jDriver(object):
                 function.arch + "'\n"
             query += "SET function_" + function.sha256 + ".bits = '" + \
                 str(function.bits) + "'\n"
-            query += "SET function_" + function.sha256 + ".opcodes = '" + \
-                json.dumps(function.opcodes) + "'\n"
             query += "SET function_" + function.sha256 + ".call_refs = '" + \
                 json.dumps(function.call_refs) + "'\n"
             query += "CREATE (sample_" + sample.sha256 + \
@@ -65,10 +65,8 @@ class Neo4jDriver(object):
 
     def create_query_get_fct_same_size(self, function):
         query = "MATCH (f:Function) WHERE f.size <= " + \
-            str(function.size * 1.05)
-        query += " AND f.size >= " + str(function.size * 0.95)
-        query += " AND f.arch == " + function.arch
-        query += " AND f.bits == " + str(function.bits)
+            str(int(function.size * 1.1))
+        query += " AND f.size >= " + str(int(function.size * 0.9))
         query += " RETURN f.sha256"
 
         return query
@@ -76,9 +74,22 @@ class Neo4jDriver(object):
     def create_query_function_similar(self, function_sha256,
                                       function_sha256_target,
                                       similarity):
-        query = "CREATE (function_" + function_sha256 + ":Function)"
-        query += "-[:SIMILAR {similarity: " + str(similarity) + "}]-"
-        query += "(function_" + function_sha256_target + ":Function)\n"
+
+        query = "CREATE (function_" + function_sha256 + ")"
+        query += "-[:SIMILAR {similarity: " + str(similarity) + "}]->"
+        query += "(function_" + function_sha256_target + ")\n"
+        """
+        query = "MATCH (funcion_" + function_sha256 + ":Function {sha256:'" + function_sha256 + \
+            "'}), (function_" + function_sha256_target + \
+            ":Function {sha256:'" + function_sha256_target + "'})\n"
+        query += "CREATE (function_" + function_sha256 + ")-[:SIMILAR_TO {similarity:" + \
+            str(similarity) + "}]->(function_" + function_sha256_target + ")\n"
+        """
+        return query
+
+    def create_query_sample_has_function(self, sample_sha256,
+                                         function_sha256):
+        query = "(" + sample_sha256 + ")-[:HAS]->(" + function_sha256 + ")"
         return query
 
 
@@ -98,13 +109,12 @@ class Sample:
 
 class Function:
     def __init__(self, md5="", sha256="", size=0, arch="",
-                 bits=0, opcodes=[], call_refs=[]):
+                 bits=0, call_refs=[]):
         self.md5 = md5
         self.sha256 = sha256
         self.size = size
         self.arch = arch
         self.bits = bits
-        self.opcodes = opcodes
         self.call_refs = call_refs
         return
 
@@ -117,15 +127,20 @@ def serve_index():
 def calculate_functions_similarity(filename_fct_analysed,
                                    filename_fct_compared_to):
     if filename_fct_analysed != filename_fct_compared_to:
+        try:
+            path_fct_analysed = FUNCTIONS_PATH + filename_fct_analysed
+            path_fct_compared_to = FUNCTIONS_PATH + filename_fct_compared_to
+            r2p = r2pipe.open('-')
+            result_diff = r2p.cmd('!radiff2 -A -C -O ' +
+                                  path_fct_analysed + " " + path_fct_compared_to)
+            result_diff = result_diff.split('\n')
+            result_diff = result_diff[-1].split('|')
+            result_diff = re.sub(
+                r'(.*)\(', '', result_diff[1]).replace(')', '')
+            return float(result_diff)
 
-        path_fct_analysed = FUNCTIONS_PATH + filename_fct_analysed
-        path_fct_compared_to = FUNCTIONS_PATH + filename_fct_compared_to
-        r2p = r2pipe.open('-')
-        result_diff = r2p.cmd('!radiff2 -A -C -O ' +
-                              path_fct_analysed + " " + path_fct_compared_to)
-        print(result_diff)
-        result_diff = result_diff.split('\n')
-        return float(result_diff[0].replace('similarity: ', ''))
+        except:
+            return 0.0
 
     else:
         return 0.0
@@ -146,40 +161,29 @@ def perform_analysis(binary_path):
     functions = []
 
     for offset in function_offsets:
-        opcodes = r2p.cmdj('pdfj @ ' + offset)['ops']
-        blocks = r2p.cmdj('afbj @ ' + offset)
-
-        """ 
-        we need to write functions block per block
-        the blocks returned are already ordered per addresses and that's super nice
-        so the algo should be something like that:
-        for i in range (0, len(blocks)):
-            write block i with wta (append to file)
-            if i != len(blocks):
-                end_addr_block_i = block[i]['addr'] + size (+ length(block[i].last_opcode) ?)
-                spaces = block[i+1]['addr'] - end_addr_blocks_i
-                wta 0 * spaces
-            else:
-                pass
-        """
 
         function_info = r2p.cmdj('afij @ ' + offset)[0]
         function_md5 = r2p.cmd(
             'ph md5 ' + str(function_info['size']) + ' @ ' + offset)
         function_sha256 = r2p.cmd(
             'ph sha256 ' + str(function_info['size']) + ' @ ' + offset)
-        function = Function(
-            function_md5,
-            function_sha256,
-            function_info['size'],
-            sample.arch,
-            sample.bits,
-            opcodes,
-            function_info['callrefs'] if 'callrefs' in function_info else [])
 
-        functions.append(function)
-        r2p.cmd('wt ' + FUNCTIONS_PATH + function.sha256 + ' ' +
-                str(function.size) + ' @ ' + offset)
+        if not os.path.isfile(FUNCTIONS_PATH + function_sha256):
+            if function_info['size'] >= 400:
+                function = Function(
+                    function_md5,
+                    function_sha256,
+                    function_info['size'],
+                    sample.arch,
+                    sample.bits,
+                    function_info['callrefs'] if 'callrefs' in function_info else [])
+
+                functions.append(function)
+
+                blocks = r2p.cmdj('afbj @ ' + offset)
+                open(FUNCTIONS_PATH + function_sha256, 'a').close()
+                r2p.cmd('s ' + offset + ';wta ' + FUNCTIONS_PATH +
+                        function.sha256 + ' $Fs @@c:afbq')
 
     sample.functions = functions
 
@@ -216,26 +220,36 @@ def post_sample():
         sample.sha256 = sha256.hexdigest()
         tmp_file.close()
         db = Neo4jDriver()
-        query = db.create_query_new_node(sample)
-
+        query_new_node = db.create_query_new_node(sample)
+        query_relationship = ""
         for function in sample.functions:
+            fct_found_in_db = False
             query_function_same_size = db.create_query_get_fct_same_size(
                 function)
             functions_same_size = db.send_query(query_function_same_size)
             similarities = {}
-
             for fct_same_size in functions_same_size:
                 fct_compared = fct_same_size[0]
-                similarities[fct_compared] = calculate_functions_similarity(
-                    function.sha256, fct_compared)
+                if fct_compared == function.sha256:
+                    query_sample_has_function = db.create_query_sample_has_function(
+                        sample.sha256, function.sha256)
+                    query_relationship += query_sample_has_function
+                    fct_found_in_db = True
+                    break
+                else:
+                    similarities[fct_compared] = calculate_functions_similarity(
+                        function.sha256, fct_compared)
+            if fct_found_in_db == False:
+                fct_max_simil = get_max_similarity(similarities)
+                if fct_max_simil is not None:
+                    if similarities[fct_max_simil] >= THRESHOLD:
+                        query_relationship += db.create_query_function_similar(
+                            function.sha256, fct_max_simil, similarities[fct_max_simil])
 
-            fct_max_simil = get_max_similarity(similarities)
-            if fct_max_simil is not None:
-                if similarities[fct_max_simil] >= THRESHOLD:
-                    query += db.create_query_function_similar(
-                        function.sha256, fct_max_simil, similarities[fct_max_simil])
+        db.send_query(query_new_node)
 
-        db.send_query(query)
+        if query_relationship != "":
+            db.send_query(query_relationship)
         db.close()
         return sample.md5 + " /// " + sample.sha256
 
