@@ -3,6 +3,7 @@ from neo4j.v1 import GraphDatabase
 import r2pipe
 import tempfile
 import json
+import jsonpickle
 import hashlib
 import os
 import string
@@ -15,8 +16,15 @@ import threading
 import queue
 import os
 import argparse
+import sys
 
 CONFIG = {}
+relationship_types = {}
+relationship_types["functions"] = "CALLS"
+relationship_types["imports"] = "IMPORTS"
+relationship_types["strings"] = "HAS"
+relationship_types["exports"] = "EXPORTS"
+relationship_types["IOC"] = "TBD"
 
 
 def setup(config_path):
@@ -105,6 +113,12 @@ class Neo4jDriver(object):
 
         return query
 
+    def create_query_get_functions(self, sample_sha256):
+        query = "MATCH (f)<-[:CALLS]-(s:Sample {{sha256:'{0}'}}) ".format(
+            sample_sha256)
+        query += "RETURN f"
+        return query
+
     def create_query_strings(self, sample):
         query = "MATCH (sample_{0}:Sample {{sha256:'{0}'}})\n".format(
             sample.sha256)
@@ -126,7 +140,8 @@ class Neo4jDriver(object):
             sample.sha256)
         for imported in sample.imports:
             imported = imported['name']
-            imported_sanit = imported.replace('.', '_')
+            imported_sanit = imported.replace(
+                '.', '_').replace('?', '_').replace('@', '_')
 
             query += "CREATE (import_{0}:Import) \n".format(imported_sanit)
             query += "SET import_{0}.name = '{1}'\n".format(
@@ -135,9 +150,9 @@ class Neo4jDriver(object):
                 sample.sha256, imported_sanit)
         return query
 
-    def create_query_get_fct_same_size(self, function):
+    def create_query_get_fct_same_size(self, fct_size):
         query = "MATCH (f:Function) WHERE f.size <= {0} AND f.size >= {1}".format(int(
-            function.size * (1+CONFIG['DIFF_SIZE_FCT'])), int(function.size * (1-CONFIG['DIFF_SIZE_FCT'])))
+            fct_size * (1+CONFIG['DIFF_SIZE_FCT'])), int(fct_size * (1-CONFIG['DIFF_SIZE_FCT'])))
         query += " RETURN f"
         return query
 
@@ -164,10 +179,10 @@ class Neo4jDriver(object):
             sample_sha256, function_sha256)
         return query
 
-    def create_query_functions_relationship(self, function, sample):
+    def create_query_functions_relationship(self, function, sample_sha256):
         query = ""
         query_function_same_size = self.create_query_get_fct_same_size(
-            function)
+            function['size'])
         functions_same_size = self.send_query(query_function_same_size)
         similarities = {}
         fct_simil_id = {}
@@ -175,7 +190,7 @@ class Neo4jDriver(object):
         queue_fct_same_size = queue.Queue(maxsize=0)
 
         for fct_same_size in functions_same_size:
-            queue_fct_same_size.put(fct_same_size)
+            queue_fct_same_size.put(fct_same_size['f'])
 
         for i in range(CONFIG['NUMBER_THREADS']):
             thread = threading.Thread(target=calculate_simil_functions, args=(
@@ -187,15 +202,14 @@ class Neo4jDriver(object):
             thread.join()
 
         fct_max_simil = get_max_similarity(similarities)
-
         if fct_max_simil is not None:
-            if similarities[fct_max_simil] == 1 and fct_max_simil == function.sha256:
+            if similarities[fct_max_simil] == 1 and fct_max_simil == function['sha256']:
                 #id_fct = fct_simil_id.get(fct_max_simil)
                 query += self.create_query_sample_calls_function(
-                    sample.sha256, function.sha256)
+                    sample_sha256, function['sha256'])
             elif similarities[fct_max_simil] >= CONFIG['THRESHOLD_SIMILARITY']:
                 query += self.create_query_function_similar(
-                    function.sha256, fct_max_simil, similarities[fct_max_simil])
+                    function['sha256'], fct_max_simil, similarities[fct_max_simil])
         return query
 
     def create_query_sample_exists(self, sample_sha256):
@@ -281,10 +295,10 @@ def create_function_from_analysis(binary_path, sample, functions, functions_sha2
                 if function_dec is not None:
                     function.ops = [op['type']
                                     for op in function_dec['ops'] if op is not None]
+                    functions.append(function)
+                    functions_sha256.append(function_sha256)
                 else:
-                    function.ops = []
-                functions.append(function)
-                functions_sha256.append(function_sha256)
+                    pass
 
         queue_offsets.task_done()
     r2p.quit()
@@ -364,18 +378,19 @@ def unique_list(l):
 def calculate_simil_functions(queue_fct_same_size, function, similarities, fct_simil_id):
     while queue_fct_same_size.empty() is False:
         fct_same_size = queue_fct_same_size.get()
-        f = fct_same_size['f']
-        if len(function.ops) > len(ast.literal_eval(f['ops'])):
-            a, b = function.ops, ast.literal_eval(f['ops'])
+
+        if len(function['ops']) > len(ast.literal_eval(fct_same_size['ops'])):
+            a, b = function['ops'], ast.literal_eval(fct_same_size['ops'])
         else:
-            a, b = ast.literal_eval(f['ops']), function.ops
+            a, b = ast.literal_eval(fct_same_size['ops']), function['ops']
 
         leven = levenshtein(a, b)
-        similarities[f['sha256']] = 1 - (leven/len(a))
+        similarities[fct_same_size['sha256']] = 1 - (leven/len(a))
 
 
 @app.route('/samples', methods=['POST'])
 def post_sample():
+    print(request.files)
     if 'file' not in request.files:
         return 'no file'
 
@@ -389,7 +404,7 @@ def post_sample():
     md5, sha256 = checksums(tmp_file)
     query_already_there = db.create_query_sample_exists(sha256.hexdigest())
     sample_exists = db.send_query(query_already_there)
-    print(sample_exists)
+
     if len(list(sample_exists)) > 0:
         return "Sample already in the DB"
 
@@ -445,15 +460,10 @@ Idea: defer the creation of the relationship between nodes when the user tries t
 '''
 
 
-@app.route('/:sha256', methods=["GET"])
+@app.route('/relation', methods=["GET"])
 def get_sample():
-    relationship_types = {}
-    relationship_types["functions"] = "CALLS"
-    relationship_types["imports"] = "IMPORTS"
-    relationship_types["strings"] = "HAS"
-    relationship_types["exports"] = "EXPORTS"
-    relationship_types["IOC"] = "TBD"
-
+    db = Neo4jDriver()
+    sample_sha256 = request.args.get("sample", default="", type=str)
     similarity = request.args.get(
         "similarity", default=CONFIG['THRESHOLD_SIMILARITY'], type=int)  # OK for strings and functions
     relationship_type = request.args.get(
@@ -463,7 +473,25 @@ def get_sample():
         return "Error"
 
     if relationship_type == "functions":
-        pass
+        query_get_functions_from_sample = db.create_query_get_functions(
+            sample_sha256)
+        functions_sample = db.send_query(query_get_functions_from_sample)
+        query_relationship = []
+
+        for item in functions_sample:
+            function = item['f']
+            query_fct_rel = db.create_query_functions_relationship(
+                function, sample_sha256)
+            if query_fct_rel != "":
+                query_relationship.append(query_fct_rel)
+
+        if query_relationship != []:
+            for query in query_relationship:
+                db.send_query(query)
+        else:
+            return "no relationship found"
+
+    return "ok"
 
 
 if __name__ == '__main__':
