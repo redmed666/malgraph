@@ -3,7 +3,6 @@ from neo4j.v1 import GraphDatabase
 import r2pipe
 import tempfile
 import json
-import jsonpickle
 import hashlib
 import os
 import string
@@ -248,24 +247,25 @@ class Function:
         return
 
 
-# From http://hetland.org/coding/python/levenshtein.py
-def levenshtein(a, b):
-    "Calculates the Levenshtein distance between a and b."
-    n, m = len(a), len(b)
-    if n > m:
-        # Make sure n <= m, to use O(min(n,m)) space
-        a, b = b, a
-        n, m = m, n
-    current = range(n+1)
-    for i in range(1, m+1):
-        previous, current = current, [i]+[0]*n
-        for j in range(1, n+1):
-            add, delete = previous[j]+1, current[j-1]+1
-            change = previous[j-1]
-            if a[j-1] != b[i-1]:
-                change = change + 1
-            current[j] = min(add, delete, change)
-    return current[n]
+# https://www.python-course.eu/levenshtein_distance.php
+def levenshtein(s, t):
+    rows = len(s)+1
+    cols = len(t)+1
+    dist = [[0 for x in range(cols)] for x in range(rows)]
+    for i in range(1, rows):
+        dist[i][0] = i
+    for i in range(1, cols):
+        dist[0][i] = i
+    for col in range(1, cols):
+        for row in range(1, rows):
+            if s[row-1] == t[col-1]:
+                cost = 0
+            else:
+                cost = 1
+            dist[row][col] = min(dist[row-1][col] + 1,
+                                 dist[row][col-1] + 1,
+                                 dist[row-1][col-1] + cost)
+    return dist[row][col]
 
 
 def create_function_from_analysis(binary_path, sample, functions, functions_sha256, queue_offsets):
@@ -378,11 +378,11 @@ def unique_list(l):
 def calculate_simil_functions(queue_fct_same_size, function, similarities, fct_simil_id):
     while queue_fct_same_size.empty() is False:
         fct_same_size = queue_fct_same_size.get()
-
-        if len(function['ops']) > len(ast.literal_eval(fct_same_size['ops'])):
-            a, b = function['ops'], ast.literal_eval(fct_same_size['ops'])
+        fct_same_size_ops = ast.literal_eval(fct_same_size['ops'])
+        if len(function['ops']) > len(fct_same_size_ops):
+            a, b = function['ops'], fct_same_size_ops
         else:
-            a, b = ast.literal_eval(fct_same_size['ops']), function['ops']
+            a, b = fct_same_size_ops, function['ops']
 
         leven = levenshtein(a, b)
         similarities[fct_same_size['sha256']] = 1 - (leven/len(a))
@@ -390,7 +390,6 @@ def calculate_simil_functions(queue_fct_same_size, function, similarities, fct_s
 
 @app.route('/samples', methods=['POST'])
 def post_sample():
-    print(request.files)
     if 'file' not in request.files:
         return 'no file'
 
@@ -460,6 +459,24 @@ Idea: defer the creation of the relationship between nodes when the user tries t
 '''
 
 
+def search_and_create_function_rel(db, sample_sha256):
+    query_get_functions_from_sample = db.create_query_get_functions(
+        sample_sha256)
+    functions_sample = db.send_query(query_get_functions_from_sample)
+    query_relationship = []
+
+    for item in functions_sample:
+        function = item['f']
+        query_fct_rel = db.create_query_functions_relationship(
+            function, sample_sha256)
+        if query_fct_rel != "":
+            query_relationship.append(query_fct_rel)
+
+    if query_relationship == []:
+        return None
+    return query_relationship
+
+
 @app.route('/relation', methods=["GET"])
 def get_sample():
     db = Neo4jDriver()
@@ -473,23 +490,11 @@ def get_sample():
         return "Error"
 
     if relationship_type == "functions":
-        query_get_functions_from_sample = db.create_query_get_functions(
-            sample_sha256)
-        functions_sample = db.send_query(query_get_functions_from_sample)
-        query_relationship = []
-
-        for item in functions_sample:
-            function = item['f']
-            query_fct_rel = db.create_query_functions_relationship(
-                function, sample_sha256)
-            if query_fct_rel != "":
-                query_relationship.append(query_fct_rel)
-
-        if query_relationship != []:
+        query_relationship = search_and_create_function_rel(db, sample_sha256)
+        if query_relationship != None:
+            print(query_relationship)
             for query in query_relationship:
                 db.send_query(query)
-        else:
-            return "no relationship found"
 
     return "ok"
 
