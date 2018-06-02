@@ -16,6 +16,8 @@ import queue
 import os
 import argparse
 import sys
+import Levenshtein
+import bktree
 
 CONFIG = {}
 relationship_types = {}
@@ -203,7 +205,7 @@ class Neo4jDriver(object):
         fct_max_simil = get_max_similarity(similarities)
         if fct_max_simil is not None:
             if similarities[fct_max_simil] == 1 and fct_max_simil == function['sha256']:
-                #id_fct = fct_simil_id.get(fct_max_simil)
+                # id_fct = fct_simil_id.get(fct_max_simil)
                 query += self.create_query_sample_calls_function(
                     sample_sha256, function['sha256'])
             elif similarities[fct_max_simil] >= CONFIG['THRESHOLD_SIMILARITY']:
@@ -307,7 +309,7 @@ def create_function_from_analysis(binary_path, sample, functions, functions_sha2
 def perform_analysis(binary_path):
     sample = Sample()
     r2p = r2pipe.open(binary_path)
-    r2p.cmd('aa')
+    # r2p.cmd('aa')
     r2p.cmd('aac')
 
     info = r2p.cmdj('iaj')
@@ -384,8 +386,13 @@ def calculate_simil_functions(queue_fct_same_size, function, similarities, fct_s
         else:
             a, b = fct_same_size_ops, function['ops']
 
-        leven = levenshtein(a, b)
-        similarities[fct_same_size['sha256']] = 1 - (leven/len(a))
+        # leven = Levenshtein.distance(a, b)
+        # similarities[fct_same_size['sha256']] = 1 - (leven/len(a))
+        # similarities[fct_same_size['sha256']] = 1 - \
+        #    (bktree.editDistance(a, b)/len(a))
+        similarities[fct_same_size['sha256']
+                     ] = difflib.SequenceMatcher(a, b).ratio()
+        queue_fct_same_size.task_done()
 
 
 @app.route('/samples', methods=['POST'])
@@ -491,7 +498,7 @@ def get_sample():
 
     if relationship_type == "functions":
         query_relationship = search_and_create_function_rel(db, sample_sha256)
-        if query_relationship != None:
+        if query_relationship is not None:
             print(query_relationship)
             for query in query_relationship:
                 db.send_query(query)
