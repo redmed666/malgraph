@@ -16,7 +16,6 @@ import queue
 import os
 import argparse
 import sys
-import Levenshtein
 import bktree
 
 CONFIG = {}
@@ -167,9 +166,8 @@ class Neo4jDriver(object):
         """
         query = "MATCH (function_{0}:Function {{sha256:'{0}'}}), (function_{1}:Function {{sha256:'{1}'}})\n".format(
             function_sha256, function_sha256_target)
-        query += "CREATE (function_{0})-[:SIMILAR_TO {similarity: {1}}]->(function_{2}\n".format(
+        query += "CREATE (function_{0})-[:SIMILAR_TO {{similarity: {1}}}]->(function_{2})\n".format(
             function_sha256, similarity, function_sha256_target)
-
         return query
 
     def create_query_sample_calls_function(self, sample_sha256,
@@ -204,6 +202,7 @@ class Neo4jDriver(object):
 
         fct_max_simil = get_max_similarity(similarities)
         if fct_max_simil is not None:
+
             if similarities[fct_max_simil] == 1 and fct_max_simil == function['sha256']:
                 # id_fct = fct_simil_id.get(fct_max_simil)
                 query += self.create_query_sample_calls_function(
@@ -296,7 +295,7 @@ def create_function_from_analysis(binary_path, sample, functions, functions_sha2
                 function_dec = r2p.cmdj('pdfj @ ' + offset)
                 if function_dec is not None:
                     function.ops = [op['type']
-                                    for op in function_dec['ops'] if op is not None]
+                                    for op in function_dec['ops'] if op is not None and 'type' in op.keys()]
                     functions.append(function)
                     functions_sha256.append(function_sha256)
                 else:
@@ -379,19 +378,21 @@ def unique_list(l):
 
 def calculate_simil_functions(queue_fct_same_size, function, similarities, fct_simil_id):
     while queue_fct_same_size.empty() is False:
+        function_ops = ast.literal_eval(function['ops'])
         fct_same_size = queue_fct_same_size.get()
         fct_same_size_ops = ast.literal_eval(fct_same_size['ops'])
-        if len(function['ops']) > len(fct_same_size_ops):
-            a, b = function['ops'], fct_same_size_ops
+        if len(function_ops) > len(fct_same_size_ops):
+            a, b = function_ops, fct_same_size_ops
         else:
-            a, b = fct_same_size_ops, function['ops']
+            a, b = fct_same_size_ops, function_ops
 
-        # leven = Levenshtein.distance(a, b)
-        # similarities[fct_same_size['sha256']] = 1 - (leven/len(a))
+        # leven = levenshtein(a, b)
+        # similarities[fct_same_size['sha256']] = 1.0 - \
+        #    (float(leven)/float(len(a)))
         # similarities[fct_same_size['sha256']] = 1 - \
-        #    (bktree.editDistance(a, b)/len(a))
+        #    (float(bktree.editDistance(a, b))/float(len(a)))
         similarities[fct_same_size['sha256']
-                     ] = difflib.SequenceMatcher(a, b).ratio()
+                     ] = difflib.SequenceMatcher(None, a, b).ratio()
         queue_fct_same_size.task_done()
 
 
@@ -499,7 +500,6 @@ def get_sample():
     if relationship_type == "functions":
         query_relationship = search_and_create_function_rel(db, sample_sha256)
         if query_relationship is not None:
-            print(query_relationship)
             for query in query_relationship:
                 db.send_query(query)
 
